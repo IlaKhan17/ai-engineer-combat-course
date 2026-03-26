@@ -1,4 +1,11 @@
-from .company import CompanyProfile
-from .database import CompanyJob, CompanyMemory, Base
+"""
+Service package exports.
 
-__all__ = ["CompanyProfile", "CompanyJob", "CompanyMemory", "Base"]
+Keep these imports aligned with actual modules in this folder to avoid
+import-time failures when the package is imported (e.g. during uvicorn startup).
+"""
+
+from .enricher import CompanyEnricher
+from .job_service import JobService
+
+__all__ = ["CompanyEnricher", "JobService"]

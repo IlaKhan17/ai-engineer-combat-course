@@ -1,0 +1,9 @@
+# Force LF for all files
+* text=auto eol=lf
+
+# Explicitly for Python files
+*.py text eol=lf
+
+# Windows batch files need CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf

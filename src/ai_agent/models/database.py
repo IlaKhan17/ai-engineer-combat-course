@@ -15,21 +15,53 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 settings = get_settings()
 
 def _normalize_asyncpg_url_for_sqlalchemy(database_url: str) -> tuple[str, dict]:
+    """
+    SQLAlchemy's asyncpg dialect passes URL query params as kwargs into
+    `asyncpg.connect(**kwargs)`.
+
+    Neon connection strings commonly include query params like:
+      - `sslmode=require`
+      - `channel_binding=require`
+
+    asyncpg.connect does NOT accept `sslmode` / `channel_binding` kwargs,
+    so we must strip them from the URL query string.
+    """
+    if not database_url:
+        return database_url, {}
+
+    database_url = database_url.strip()
     if not database_url.startswith("postgresql+asyncpg://"):
         return database_url, {}
 
     parsed = urlparse(database_url)
-    query = parse_qs(parsed.query, keep_blank_values=True)
+    query = parsed.query or ""
+
+    keep_parts: list[str] = []
+    found_sslmode = False
+    found_channel_binding = False
+
+    # Filter query by key while preserving the original value/encoding.
+    for part in query.split("&"):
+        if not part:
+            continue
+        key = part.split("=", 1)[0]
+        key_lower = key.lower()
+        if key_lower == "sslmode":
+            found_sslmode = True
+            continue
+        if key_lower == "channel_binding":
+            found_channel_binding = True
+            continue
+        keep_parts.append(part)
+
+    new_query = "&".join(keep_parts)
+    normalized_url = urlunparse(parsed._replace(query=new_query))
 
     connect_args: dict = {}
-    if "sslmode" in query:
+    if found_sslmode or found_channel_binding:
+        # asyncpg expects `ssl` (bool or SSLContext), not `sslmode`.
         connect_args["ssl"] = True
-        query.pop("sslmode", None)
 
-    query.pop("channel_binding", None)
-
-    new_query = urlencode(query, doseq=True)
-    normalized_url = urlunparse(parsed._replace(query=new_query))
     return normalized_url, connect_args
 
 
@@ -79,10 +111,12 @@ class CompanyMemory(Base):
 # ── Engine + Session ──────────────────────────────────────────────────────────
 engine = create_async_engine(
     normalized_url,
-    echo=settings.debug,       # logs all SQL when debug=True
-    pool_size=5,               # max 5 connections open at once
-    max_overflow=10,           # allow 10 extra during traffic spikes
-    connect_args=connect_args  # e.g. {"ssl": True} for Neon
+    echo=settings.debug,
+    connect_args=connect_args,  # e.g. {"ssl": True} for Neon
+    pool_pre_ping=True,     # avoid "connection is closed" from stale pooled conns
+    pool_recycle=1800,      # recycle connections every 30 minutes (dev-safe)
+    pool_size=5,
+    max_overflow=10,
 )
 
 # Session factory — use this everywhere instead of creating sessions manually
@@ -92,17 +126,29 @@ AsyncSessionLocal = async_sessionmaker(
     expire_on_commit=False     # keep objects usable after commit
 )
 
+async def init_db() -> None:
+    """
+    Dev-friendly DB initialization.
+
+    Ensures tables exist so the API doesn't 500 before you run migrations.
+    In production, prefer Alembic migrations over create_all().
+    """
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
 
 # ── Dependency for FastAPI ────────────────────────────────────────────────────
 async def get_db():
     """
     FastAPI dependency that gives each endpoint its own DB session.
-    Automatically commits on success, rolls back on error.
+
+    Do NOT auto-commit here:
+    - write operations are committed inside service methods (JobService)
+    - read-only endpoints (GET) should not commit
     """
     async with AsyncSessionLocal() as session:
         try:
             yield session
-            await session.commit()
         except Exception:
             await session.rollback()
             raise

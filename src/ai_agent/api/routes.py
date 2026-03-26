@@ -1,32 +1,27 @@
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Annotated
 from datetime import datetime
-import uuid
-import asyncio
 
 from src.ai_agent.services.enricher import CompanyEnricher
+from src.ai_agent.services.job_service import JobService
+from src.ai_agent.models.database import get_db, CompanyMemory
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+import logging
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["Companies"])
-
-# ── In-Memory Store (replaces DB for now) ────────────────────────────────────
-# This is a dict that acts like a database
-# Key = job_id, Value = job status + results
-jobs: dict[str, dict] = {}
 
 
 # ── Request/Response Models ───────────────────────────────────────────────────
 class EnrichRequest(BaseModel):
-    companies: list[str] = Field(
-        ...,
-        min_length=1,
-        max_length=20,
-        description="List of company names to enrich"
-    )
+    companies: list[str] = Field(..., min_length=1, max_length=20)
+
 
 class JobStatus(BaseModel):
     job_id: str
-    status: str                          # pending, running, completed, failed
+    status: str
     created_at: datetime
     completed_at: Optional[datetime] = None
     total: int = 0
@@ -35,82 +30,102 @@ class JobStatus(BaseModel):
     results: list[dict] = []
     failures: list[str] = []
 
+    # This tells Pydantic to read from SQLAlchemy objects directly
+    model_config = {"from_attributes": True}
+
 
 # ── Background Task ───────────────────────────────────────────────────────────
 async def run_enrichment_job(job_id: str, company_names: list[str]):
     """
-    This runs AFTER the HTTP response is sent.
-    Client gets job_id instantly, then polls for results.
+    Runs after HTTP response is sent.
+    Has its OWN database session — cannot use the request's session
+    because that closes when the response is sent.
     """
-    jobs[job_id]["status"] = "running"
+    from src.ai_agent.models.database import AsyncSessionLocal
 
-    enricher = CompanyEnricher(max_retries=3)
-    profiles, failures = await enricher.enrich_companies(company_names)
+    async with AsyncSessionLocal() as session:
+        service = JobService(session)
+        try:
+            await service.mark_running(job_id)
 
-    # Update job with results
-    jobs[job_id].update({
-        "status": "completed",
-        "completed_at": datetime.utcnow(),
-        "total": len(company_names),
-        "successful": len(profiles),
-        "failed": len(failures),
-        "results": [p.model_dump() for p in profiles],
-        "failures": failures
-    })
+            enricher = CompanyEnricher(max_retries=3)
+            profiles, failures = await enricher.enrich_companies(company_names)
+
+            # Save results to jobs table
+            await service.complete_job(job_id, profiles, failures)
+
+            # Save companies to long-term memory
+            if profiles:
+                await service.save_companies(profiles)
+
+        except Exception as e:
+            await service.fail_job(job_id, str(e))
+            logger.error(f"Background job crashed: {e}")
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @router.post("/enrich", response_model=JobStatus, status_code=202)
 async def enrich_companies(
     request: EnrichRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    db: Annotated[AsyncSession, Depends(get_db)]
 ):
-    """
-    Start an enrichment job.
-    Returns job_id immediately (202 Accepted).
-    Client polls GET /jobs/{job_id} for results.
-    """
-    job_id = str(uuid.uuid4())[:8]  # short readable ID
-
-    # Create job record
-    jobs[job_id] = {
-        "job_id": job_id,
-        "status": "pending",
-        "created_at": datetime.utcnow(),
-        "completed_at": None,
-        "total": len(request.companies),
-        "successful": 0,
-        "failed": 0,
-        "results": [],
-        "failures": []
-    }
-
-    # Start enrichment WITHOUT blocking the response
+    logger.info(f"Enriching companies: {request.companies}")
+    service = JobService(db)
+    logger.info(f"Creating job: {request.companies}")
+    job = await service.create_job(request.companies)
+    logger.info(f"Adding background task: {request.companies}")
     background_tasks.add_task(
         run_enrichment_job,
-        job_id,
+        job.job_id,
         request.companies
     )
-
-    return JobStatus(**jobs[job_id])
+    logger.info(f"Returning job: {request.companies}")
+    return JobStatus.model_validate(job)
 
 
 @router.get("/jobs/{job_id}", response_model=JobStatus)
-async def get_job_status(job_id: str):
-    """
-    Poll this endpoint to check enrichment progress.
-    """
-    if job_id not in jobs:
+async def get_job(
+    job_id: str,
+    db: Annotated[AsyncSession, Depends(get_db)]
+):
+    service = JobService(db)
+    job = await service.get_job(job_id)
+
+    if not job:
         raise HTTPException(
             status_code=404,
             detail=f"Job '{job_id}' not found"
         )
-    return JobStatus(**jobs[job_id])
+    return JobStatus.model_validate(job)
 
 
 @router.get("/jobs", response_model=list[JobStatus])
-async def list_all_jobs():
+async def list_jobs(db: Annotated[AsyncSession, Depends(get_db)]):
+    service = JobService(db)
+    jobs = await service.get_all_jobs()
+    return [JobStatus.model_validate(j) for j in jobs]
+
+
+@router.get("/companies", response_model=list[dict])
+async def list_companies(db: Annotated[AsyncSession, Depends(get_db)]):
     """
-    List all enrichment jobs.
+    Returns all companies stored in long-term memory.
+    This persists across server restarts — unlike the old dict.
     """
-    return [JobStatus(**job) for job in jobs.values()]
+    result = await db.execute(
+        select(CompanyMemory).order_by(CompanyMemory.enriched_at.desc())
+    )
+    companies = result.scalars().all()
+    return [
+        {
+            "id": c.id,
+            "name": c.name,
+            "domain": c.domain,
+            "employee_count": c.employee_count,
+            "industry": c.industry,
+            "funding_stage": c.funding_stage,
+            "enriched_at": c.enriched_at.isoformat()
+        }
+        for c in companies
+    ]

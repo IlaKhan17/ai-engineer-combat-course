@@ -87,20 +87,20 @@ class CompanyEnricher:
         for attempt in range(1, self.max_retries + 1):
             try:
                 data = await self._fetch_company_data(name)
-                logger.info(f"✅ Fetched: {name} (attempt {attempt})")
+                logger.info(f"Fetched: {name} (attempt {attempt})")
                 return data
 
             except ConnectionError as e:
                 wait_time = 2 ** (attempt - 1)  # 1, 2, 4 seconds
-                logger.warning(f"⚠️  {e} — retrying in {wait_time}s (attempt {attempt}/{self.max_retries})")
+                logger.warning(f"Warning: {e} — retrying in {wait_time}s (attempt {attempt}/{self.max_retries})")
                 await asyncio.sleep(wait_time)
 
             except ValueError as e:
                 # Don't retry if company simply doesn't exist
-                logger.error(f"❌ {e}")
+                logger.error(f"Error: {e}")
                 return None
 
-        logger.error(f"❌ All {self.max_retries} attempts failed for: {name}")
+        logger.error(f"Error: All {self.max_retries} attempts failed for: {name}")
         return None
 
     async def enrich_companies(
@@ -113,7 +113,7 @@ class CompanyEnricher:
         Without gather: 5 companies × 1.5s = 7.5 seconds total
         With gather:    all 5 run at same time = ~1.5 seconds total
         """
-        logger.info(f"🚀 Starting enrichment for {len(company_names)} companies...")
+        logger.info(f"Starting enrichment for {len(company_names)} companies...")
 
         # Launch all fetches at the same time
         tasks = [self._fetch_with_retry(name) for name in company_names]
@@ -127,7 +127,7 @@ class CompanyEnricher:
             # gather() with return_exceptions=True means exceptions
             # come back as values — we check for them manually
             if isinstance(result, Exception):
-                logger.error(f"❌ Unexpected error for {name}: {result}")
+                logger.error(f"Unexpected error for {name}: {result}")
                 failed.append(name)
                 continue
 
@@ -140,8 +140,8 @@ class CompanyEnricher:
                 profile = CompanyProfile(**result)
                 successful.append(profile)
             except Exception as e:
-                logger.error(f"❌ Validation failed for {name}: {e}")
+                logger.error(f"Validation failed for {name}: {e}")
                 failed.append(name)
 
-        logger.info(f"✅ Done — {len(successful)} succeeded, {len(failed)} failed")
+        logger.info(f"Done — {len(successful)} succeeded, {len(failed)} failed")
         return successful, failed
