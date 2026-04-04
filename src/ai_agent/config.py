@@ -9,7 +9,8 @@ ENV_PATH = _default_env if _default_env.exists() else _fallback_env
 
 
 class Settings(BaseSettings):
-    openai_api_key: str = "sk-placeholder"
+    openai_api_key: str = "sk-...wuAA"
+    openai_model: str = "gpt-4o-mini"
     database_url: str = "sqlite:///./dev.db"
     redis_url: str = "redis://localhost:6379"
     debug: bool = True

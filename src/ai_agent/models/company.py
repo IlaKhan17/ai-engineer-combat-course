@@ -8,22 +8,23 @@ class CompanyProfile(BaseModel):
     domain: str = Field(..., description="Company website domain")
     employee_count: Optional[int] = Field(default=None, ge=1)
     industry: str = Field(default="Unknown")
-    funding_stage: Optional[str] = Field(
-        default=None,
-        description="e.g. Seed, Series A, Series B, Public"
-    )
+    funding_stage: Optional[str] = Field(default=None)
+    headquarters: Optional[str] = Field(default=None)   # ← new
+    founded_year: Optional[int] = Field(default=None)   # ← new
+    description: Optional[str] = Field(default=None)    # ← new
     enriched_at: datetime = Field(default_factory=datetime.utcnow)
 
     @field_validator("domain")
     @classmethod
     def clean_domain(cls, v: str) -> str:
-        # Remove https:// or http:// if someone passes full URL
         return v.replace("https://", "").replace("http://", "").strip("/")
 
     @field_validator("funding_stage")
     @classmethod
     def validate_funding(cls, v: Optional[str]) -> Optional[str]:
-        valid_stages = {"Seed", "Series A", "Series B", "Series C", "Public", "Bootstrapped"}
-        if v and v not in valid_stages:
-            raise ValueError(f"funding_stage must be one of {valid_stages}")
+        if v is None:
+            return None
+        valid = {"Seed", "Series A", "Series B", "Series C", "Public", "Bootstrapped"}
+        if v not in valid:
+            return None    # don't crash, just nullify invalid values
         return v
