@@ -1,3 +1,4 @@
+from src.ai_agent.services.langchain_service import LangChainService
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
 from pydantic import BaseModel, Field
 from typing import Optional, Annotated
@@ -129,3 +130,53 @@ async def list_companies(db: Annotated[AsyncSession, Depends(get_db)]):
         }
         for c in companies
     ]
+    
+# ── Research Endpoints ─────────────────────────────────────────────────────────
+@router.get("/research/{company_name}")
+async def research_company(company_name: str):
+        """
+        Research a single company using LangChain.
+        Returns structured data + investor summary.
+        """
+        service = LangChainService()
+
+        try:
+            result = await service.research_and_summarize(company_name)
+            return result
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Research failed: {str(e)}"
+            )
+            
+@router.post("/research/batch")
+async def research_batch(request: EnrichRequest):
+    """
+    Research multiple companies concurrently using LangChain.
+    All LLM calls run simultaneously with asyncio.gather().
+    """
+    service = LangChainService()
+
+    import asyncio
+    tasks = [
+        service.research_and_summarize(name)
+        for name in request.companies
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    successful = []
+    failed = []
+
+    for name, result in zip(request.companies, results):
+        if isinstance(result, Exception):
+            failed.append({"company": name, "error": str(result)})
+        else:
+            successful.append(result)
+
+    return {
+        "successful": successful,
+        "failed": failed,
+        "total": len(request.companies),
+        "success_count": len(successful)
+    }
